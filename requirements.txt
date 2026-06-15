@@ -1,0 +1,17 @@
+# Orquestación de Agentes de IA (LangGraph / LCEL) y Conector MCP
+langchain>=0.2.0
+langchain-core>=0.2.0
+langgraph>=0.2.0
+langchain-redis>=0.2.0
+langchain-openai>=0.1.0
+langchain-mcp-adapters>=0.2.0
+fastapi>=0.110.0
+uvicorn>=0.28.0
+
+# Base de Datos Vectorial (Milvus RAG) y Embeddings
+langchain-milvus>=0.1.0
+pymilvus>=2.4.0
+python-dotenv>=1.0.0
+
+# Memoria Conversacional (Redis Cache)
+redis>=5.0.0

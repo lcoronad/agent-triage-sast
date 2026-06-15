@@ -1,0 +1,33 @@
+{
+  "SchemaVersion": 2,
+  "ArtifactName": "my-app:1.0",
+  "ArtifactType": "container_image",
+  "Metadata": {
+    "ImageConfig": {
+      "architecture": "amd64"
+    }
+  },
+  "Results": [
+    {
+      "Target": "my-app:1.0 (alpine 3.19.1)",
+      "Class": "os-pkgs",
+      "Type": "alpine",
+      "Vulnerabilities": [
+        {
+          "VulnerabilityID": "CVE-2023-42364",
+          "PkgName": "busybox",
+          "InstalledVersion": "1.36.1-r2",
+          "FixedVersion": "1.36.1-r5",
+          "Severity": "MEDIUM",
+          "Title": "busybox: use-after-free in awk",
+          "Description": "A use-after-free vulnerability exists in BusyBox...",
+          "SeveritySource": "nvd",
+          "References": [
+            "https://mitre.org"
+          ]
+        }
+      ]
+    }
+  ]
+}
+

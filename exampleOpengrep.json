@@ -1,0 +1,48 @@
+{
+  "version": "2.1.0",
+  "$schema": "https://schemastore.org",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "Opengrep",
+          "rules": [
+            {
+              "id": "rules.unwrapped-result",
+              "shortDescription": {
+                "text": "Unwrap detected - potential panic risk"
+              },
+              "properties": {
+                "precision": "high",
+                "severity": "WARNING"
+              }
+            }
+          ]
+        }
+      },
+      "results": [
+        {
+          "ruleId": "rules.unwrapped-result",
+          "message": {
+            "text": "Unwrap detected - potential panic risk"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "code/rust/main.rs"
+                },
+                "region": {
+                  "startLine": 9,
+                  "startColumn": 33,
+                  "endColumn": 41
+                }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+
