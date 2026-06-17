@@ -46,6 +46,7 @@ github_tool_url = os.getenv("GITHUB_TOOL_URL", "http://cluster.local")
 milvus_host = os.getenv("MILVUS_HOST", "milvus-service")
 milvus_port = os.getenv("MILVUS_PORT", "19530")
 milvus_collection_name = os.getenv("MILVUS_COLLECTION_NAME", "company_coding_standards")
+milvus_uri = "http://" + milvus_host + ":" + milvus_port
 
 triage_system_prompt = os.getenv(
     "TRIAGE_SYSTEM_PROMPT",
@@ -80,7 +81,7 @@ embeddings = OpenAIEmbeddings(
 )
 vector_store = Milvus(
     embedding_function=embeddings,
-    connection_args={"host": milvus_host, "port": milvus_port},
+    connection_args={"uri": milvus_uri},
     collection_name=milvus_collection_name,
 )
 
