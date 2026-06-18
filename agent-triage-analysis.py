@@ -1,6 +1,7 @@
+import logging
 import os
 import json
-from typing import Sequence
+from typing import Any, Sequence
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, BackgroundTasks, Request
@@ -9,11 +10,21 @@ from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_milvus import Milvus
 from langchain_redis import RedisChatMessageHistory
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 load_dotenv()
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_MAX_CHARS = int(os.getenv("LOG_MAX_CHARS", "2000"))
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    force=True,
+)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Triage Analysis Agent Platform")
 
@@ -24,6 +35,67 @@ GRAPH_RECURSION_LIMIT = int(os.getenv("GRAPH_RECURSION_LIMIT", "50"))
 def _api_base(url: str) -> str:
     normalized = url.rstrip("/")
     return normalized if normalized.endswith("/v1") else f"{normalized}/v1"
+
+
+def _mcp_sse_url(url: str) -> str:
+    normalized = url.rstrip("/")
+    return normalized if normalized.endswith("/sse") else f"{normalized}/sse"
+
+
+def _truncate_text(text: str, max_len: int = LOG_MAX_CHARS) -> str:
+    if len(text) <= max_len:
+        return text
+    return f"{text[:max_len]}... [truncado, total={len(text)} chars]"
+
+
+def _message_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                parts.append(block.get("text", json.dumps(block, ensure_ascii=False)))
+            else:
+                parts.append(str(block))
+        return "\n".join(parts)
+    return str(content)
+
+
+def _log_message(message: BaseMessage, context: str) -> None:
+    content = _message_content(message.content)
+
+    if isinstance(message, HumanMessage):
+        logger.info("[%s] INPUT usuario: %s", context, _truncate_text(content))
+        return
+
+    if isinstance(message, AIMessage):
+        for tool_call in message.tool_calls or []:
+            logger.info(
+                "[%s] LLM -> invoca tool: %s | args=%s",
+                context,
+                tool_call.get("name"),
+                _truncate_text(
+                    json.dumps(tool_call.get("args", {}), ensure_ascii=False),
+                    800,
+                ),
+            )
+        if content:
+            logger.info("[%s] LLM respuesta: %s", context, _truncate_text(content))
+        return
+
+    if isinstance(message, ToolMessage):
+        logger.info(
+            "[%s] MCP/tool resultado [%s]: %s",
+            context,
+            message.name or "unknown",
+            _truncate_text(content),
+        )
+        return
+
+    logger.info("[%s] %s: %s", context, message.__class__.__name__, _truncate_text(content))
 
 
 base_url = _api_base(os.getenv("QWEN_API_URL", "http://vllm-qwen-service:8000/v1"))
@@ -90,12 +162,12 @@ def _mcp_client() -> MultiServerMCPClient:
     return MultiServerMCPClient(
         {
             "slack": {
-                "transport": "http",
-                "url": slack_tool_url,
+                "transport": "sse",
+                "url": _mcp_sse_url(slack_tool_url),
             },
             "github": {
-                "transport": "http",
-                "url": github_tool_url,
+                "transport": "sse",
+                "url": _mcp_sse_url(github_tool_url),
             },
         }
     )
@@ -110,7 +182,13 @@ def query_company_coding_standards(query: str) -> str:
 
 async def _get_agent_tools():
     client = _mcp_client()
-    return await client.get_tools() + [query_company_coding_standards]
+    tools = await client.get_tools() + [query_company_coding_standards]
+    logger.info(
+        "Tools cargadas (%s): %s",
+        len(tools),
+        ", ".join(tool.name for tool in tools),
+    )
+    return tools
 
 
 async def _build_agent(system_prompt: str):
@@ -153,12 +231,48 @@ async def _run_agent(
     agent,
     prompt: str,
     prior_messages: Sequence[BaseMessage] | None = None,
+    *,
+    context: str = "agent",
 ) -> dict:
     messages = list(prior_messages or []) + [HumanMessage(content=prompt)]
-    return await agent.ainvoke(
+    logger.info("[%s] Iniciando ejecución del agente", context)
+
+    result: dict | None = None
+    seen_messages = 0
+
+    async for state in agent.astream(
         {"messages": messages},
         config={"recursion_limit": GRAPH_RECURSION_LIMIT},
+        stream_mode="values",
+    ):
+        current_messages = state.get("messages", [])
+        for message in current_messages[seen_messages:]:
+            _log_message(message, context)
+        seen_messages = len(current_messages)
+        result = state
+
+    if result is None:
+        result = await agent.ainvoke(
+            {"messages": messages},
+            config={"recursion_limit": GRAPH_RECURSION_LIMIT},
+        )
+        for message in result.get("messages", [])[seen_messages:]:
+            _log_message(message, context)
+
+    final_ai = _final_ai_message(result.get("messages", []))
+    if final_ai is not None:
+        logger.info(
+            "[%s] Respuesta final del agente: %s",
+            context,
+            _truncate_text(_message_content(final_ai.content)),
+        )
+
+    logger.info(
+        "[%s] Ejecución finalizada. Total mensajes=%s",
+        context,
+        len(result.get("messages", [])),
     )
+    return result
 
 
 def _persist_slack_turn(
@@ -184,33 +298,53 @@ class TriageRequest(BaseModel):
 
 
 async def process_async_triage(data: TriageRequest):
-    agent = await _build_agent(triage_system_prompt)
-    prompt = (
-        f"Analiza estos reportes: TRIVY: {json.dumps(data.trivy_json)[:15000]} "
-        f"y OPENGREP: {json.dumps(data.opengrep_sarif)[:20000]}.\n"
-        f"1. Genera soluciones específicas de remediación.\n"
-        f"2. Comenta en el repositorio '{data.repo_path}' PR '{data.pull_request_number}'.\n"
-        f"3. Envía una notificación de fin de análisis a Slack."
-    )
-    await _run_agent(agent, prompt)
+    try:
+        agent = await _build_agent(triage_system_prompt)
+        prompt = (
+            f"Analiza estos reportes: TRIVY: {json.dumps(data.trivy_json)[:15000]} "
+            f"y OPENGREP: {json.dumps(data.opengrep_sarif)[:20000]}.\n"
+            f"1. Genera soluciones específicas de remediación lo más detalladas posible"
+             " y usa la herramienta de query_company_coding_standards para dar mayor explicacion.\n"
+            f"2. Comenta el detalle de las remediaciones en el repositorio '{data.repo_path}' PR '{data.pull_request_number}' usando la herramienta de github_comment.\n"
+            f"3. Envía una notificación de fin de análisis a Slack indicando que el análisis ha finalizado usando la herramienta de slack_message."
+        )
+        await _run_agent(
+            agent,
+            prompt,
+            context=f"triage:{data.repo_path}#PR{data.pull_request_number}",
+        )
+    except Exception:
+        logger.exception(
+            "Triage falló para repo=%s pr=%s",
+            data.repo_path,
+            data.pull_request_number,
+        )
 
 
 async def handle_slack_mention(event: dict):
-    channel = event.get("channel")
-    thread_ts = event.get("thread_ts", event.get("ts"))
-    session_id = f"slack:{thread_ts}"
+    try:
+        channel = event.get("channel")
+        thread_ts = event.get("thread_ts", event.get("ts"))
+        session_id = f"slack:{thread_ts}"
 
-    history = _redis_history(session_id)
-    prior_messages = _window_messages(history.messages)
+        history = _redis_history(session_id)
+        prior_messages = _window_messages(history.messages)
 
-    agent = await _build_agent(slack_system_prompt)
-    prompt = (
-        f"El desarrollador preguntó en Slack: {event.get('text')}. "
-        f"Responde usando las herramientas de Slack en el canal '{channel}' "
-        f"e hilo '{thread_ts}' e investiga las normativas internas si es necesario."
-    )
-    result = await _run_agent(agent, prompt, prior_messages=prior_messages)
-    _persist_slack_turn(session_id, prompt, result["messages"])
+        agent = await _build_agent(slack_system_prompt)
+        prompt = (
+            f"El desarrollador preguntó en Slack: {event.get('text')}. "
+            f"Responde usando las herramientas de Slack en el canal '{channel}' "
+            f"e hilo '{thread_ts}' e investiga las normativas internas si es necesario."
+        )
+        result = await _run_agent(
+            agent,
+            prompt,
+            prior_messages=prior_messages,
+            context=f"slack:{session_id}",
+        )
+        _persist_slack_turn(session_id, prompt, result["messages"])
+    except Exception:
+        logger.exception("Slack mention falló para evento=%s", event.get("ts"))
 
 
 @app.post("/api/v1/triage")
