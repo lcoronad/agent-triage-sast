@@ -136,6 +136,28 @@ slack_system_prompt = os.getenv(
         "Consulta las normas internas de codificación cuando el desarrollador lo requiera."
     ),
 )
+triage_user_prompt_template = os.getenv(
+    "TRIAGE_USER_PROMPT",
+    (
+        "Analiza estos reportes: TRIVY: {trivy_json} y OPENGREP: {opengrep_sarif}.\n"
+        "1. Genera soluciones específicas de remediación lo más detalladas posible "
+        "y usa la herramienta de query_company_coding_standards para dar mayor explicacion.\n"
+        "2. Comenta el detalle de las remediaciones en el repositorio '{repo_path}' "
+        "PR '{pull_request_number}' usando la herramienta de github_comment.\n"
+        "3. Envía una notificación de fin de análisis a Slack indicando que el análisis "
+        "ha finalizado usando la herramienta de slack_message."
+    ),
+)
+slack_user_prompt_template = os.getenv(
+    "SLACK_USER_PROMPT",
+    (
+        "El desarrollador preguntó en Slack: {slack_text}. "
+        "Responde usando las herramientas de Slack en el canal '{channel}' "
+        "e hilo '{thread_ts}' e investiga las normativas internas si es necesario."
+    ),
+)
+TRIVY_JSON_MAX_CHARS = int(os.getenv("TRIVY_JSON_MAX_CHARS", "15000"))
+OPENGREP_JSON_MAX_CHARS = int(os.getenv("OPENGREP_JSON_MAX_CHARS", "20000"))
 
 llm = ChatOpenAI(
     base_url=base_url,
@@ -297,17 +319,29 @@ class TriageRequest(BaseModel):
     opengrep_sarif: dict
 
 
+def _build_triage_prompt(data: TriageRequest) -> str:
+    return triage_user_prompt_template.format(
+        trivy_json=json.dumps(data.trivy_json, ensure_ascii=False)[:TRIVY_JSON_MAX_CHARS],
+        opengrep_sarif=json.dumps(data.opengrep_sarif, ensure_ascii=False)[
+            :OPENGREP_JSON_MAX_CHARS
+        ],
+        repo_path=data.repo_path,
+        pull_request_number=data.pull_request_number,
+    )
+
+
+def _build_slack_prompt(event: dict, channel: str, thread_ts: str) -> str:
+    return slack_user_prompt_template.format(
+        slack_text=event.get("text", ""),
+        channel=channel,
+        thread_ts=thread_ts,
+    )
+
+
 async def process_async_triage(data: TriageRequest):
     try:
         agent = await _build_agent(triage_system_prompt)
-        prompt = (
-            f"Analiza estos reportes: TRIVY: {json.dumps(data.trivy_json)[:15000]} "
-            f"y OPENGREP: {json.dumps(data.opengrep_sarif)[:20000]}.\n"
-            f"1. Genera soluciones específicas de remediación lo más detalladas posible"
-             " y usa la herramienta de query_company_coding_standards para dar mayor explicacion.\n"
-            f"2. Comenta el detalle de las remediaciones en el repositorio '{data.repo_path}' PR '{data.pull_request_number}' usando la herramienta de github_comment.\n"
-            f"3. Envía una notificación de fin de análisis a Slack indicando que el análisis ha finalizado usando la herramienta de slack_message."
-        )
+        prompt = _build_triage_prompt(data)
         await _run_agent(
             agent,
             prompt,
@@ -331,11 +365,7 @@ async def handle_slack_mention(event: dict):
         prior_messages = _window_messages(history.messages)
 
         agent = await _build_agent(slack_system_prompt)
-        prompt = (
-            f"El desarrollador preguntó en Slack: {event.get('text')}. "
-            f"Responde usando las herramientas de Slack en el canal '{channel}' "
-            f"e hilo '{thread_ts}' e investiga las normativas internas si es necesario."
-        )
+        prompt = _build_slack_prompt(event, channel, thread_ts)
         result = await _run_agent(
             agent,
             prompt,
