@@ -1,12 +1,14 @@
 import logging
 import os
 import json
+import requests
 from typing import Any, Sequence
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, BackgroundTasks, Request
 from pydantic import BaseModel
 from langchain.agents import create_agent
+from langchain.agents.middleware import AgentMiddleware
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_milvus import Milvus
 from langchain_redis import RedisChatMessageHistory
@@ -30,6 +32,15 @@ app = FastAPI(title="Triage Analysis Agent Platform")
 
 MEMORY_WINDOW_K = int(os.getenv("MEMORY_WINDOW_K", "10"))
 GRAPH_RECURSION_LIMIT = int(os.getenv("GRAPH_RECURSION_LIMIT", "50"))
+PARALLEL_TOOL_CALLS = os.getenv("PARALLEL_TOOL_CALLS", "false").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+SINGLE_TOOL_CALL_RULE = (
+    "\n\nIMPORTANTE: Invoca como máximo UNA herramienta por turno. "
+    "Espera el resultado antes de llamar la siguiente herramienta."
+)
 
 
 def _api_base(url: str) -> str:
@@ -98,6 +109,65 @@ def _log_message(message: BaseMessage, context: str) -> None:
     logger.info("[%s] %s: %s", context, message.__class__.__name__, _truncate_text(content))
 
 
+class SingleToolCallMiddleware(AgentMiddleware):
+    """Fuerza una sola tool-call por turno (requerido por vLLM/Llama)."""
+
+    def _apply_single_tool_call_setting(self, request) -> None:
+        if PARALLEL_TOOL_CALLS:
+            return
+
+        model_settings = getattr(request, "model_settings", None)
+        if isinstance(model_settings, dict):
+            model_settings["parallel_tool_calls"] = False
+            return
+
+        tools = getattr(request, "tools", None)
+        if tools:
+            request.model = request.model.bind_tools(tools, parallel_tool_calls=False)
+
+    def _truncate_extra_tool_calls(self, state) -> dict | None:
+        messages = state.get("messages", [])
+        if not messages:
+            return None
+
+        last = messages[-1]
+        if (
+            not isinstance(last, AIMessage)
+            or not last.tool_calls
+            or len(last.tool_calls) <= 1
+        ):
+            return None
+
+        logger.warning(
+            "Modelo devolvió %s tool_calls; truncando a 1 para compatibilidad vLLM",
+            len(last.tool_calls),
+        )
+        last.tool_calls = [last.tool_calls[0]]
+        return None
+
+    def wrap_model_call(self, request, handler):
+        self._apply_single_tool_call_setting(request)
+        return handler(request)
+
+    async def awrap_model_call(self, request, handler):
+        self._apply_single_tool_call_setting(request)
+        return await handler(request)
+
+    def after_model(self, state, runtime):
+        return self._truncate_extra_tool_calls(state)
+
+    async def aafter_model(self, state, runtime):
+        return self._truncate_extra_tool_calls(state)
+
+
+def _system_prompt_with_rules(system_prompt: str) -> str:
+    if PARALLEL_TOOL_CALLS:
+        return system_prompt
+    if SINGLE_TOOL_CALL_RULE.strip() in system_prompt:
+        return system_prompt
+    return f"{system_prompt.rstrip()}{SINGLE_TOOL_CALL_RULE}"
+
+
 base_url = _api_base(os.getenv("QWEN_API_URL", "http://vllm-qwen-service:8000/v1"))
 model_id = os.getenv("QWEN_MODEL_NAME", "qwen2.5-coder:32b-instruct")
 api_key = os.getenv("QWEN_API_KEY", "")
@@ -145,7 +215,9 @@ triage_user_prompt_template = os.getenv(
         "2. Comenta el detalle de las remediaciones en el repositorio '{repo_path}' "
         "PR '{pull_request_number}' usando la herramienta de github_comment.\n"
         "3. Envía una notificación de fin de análisis a Slack indicando que el análisis "
-        "ha finalizado usando la herramienta de slack_message."
+        "ha finalizado usando la herramienta de slack_message.\n"
+        "Ejecuta los pasos de forma secuencial: una herramienta por turno, "
+        "esperando el resultado antes de continuar."
     ),
 )
 slack_user_prompt_template = os.getenv(
@@ -158,6 +230,7 @@ slack_user_prompt_template = os.getenv(
 )
 TRIVY_JSON_MAX_CHARS = int(os.getenv("TRIVY_JSON_MAX_CHARS", "15000"))
 OPENGREP_JSON_MAX_CHARS = int(os.getenv("OPENGREP_JSON_MAX_CHARS", "20000"))
+token = os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN")
 
 llm = ChatOpenAI(
     base_url=base_url,
@@ -202,9 +275,60 @@ def query_company_coding_standards(query: str) -> str:
     return "\n\n".join([f"[Norma]: {d.page_content}" for d in docs])
 
 
+import os
+import requests
+from langchain_core.tools import tool
+
+@tool
+def publicar_anotaciones_de_seguridad(owner: str, repo: str, head_sha: str, anotaciones: list) -> str:
+    """
+    Crea un 'Check Run' en GitHub con anotaciones línea por línea para reportar vulnerabilidades en el código.
+    
+    Parámetros requeridos:
+    - owner: El dueño de la organización o repositorio (ej. 'mi-empresa').
+    - repo: El nombre del repositorio (ej. 'frontend-app').
+    - head_sha: El hash del último commit del Pull Request que se está analizando.
+    - anotaciones: Una lista de diccionarios. CADA diccionario debe tener EXACTAMENTE este formato:
+      {
+        "path": "ruta/al/archivo.py",
+        "start_line": numero_de_linea_entero,
+        "end_line": numero_de_linea_entero,
+        "annotation_level": "warning", # Usa "warning" o "failure"
+        "message": "La recomendación técnica y remediación generada por el agente",
+        "title": "CWE-XXX o Nombre de la vulnerabilidad"
+      }
+    """
+    url = f"https://api.github.com/repos/{owner}/{repo}/check-runs"
+    
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+    
+    payload = {
+        "name": "Agente DevSecOps (Qwen-3)",
+        "head_sha": head_sha,
+        "status": "completed",
+        "conclusion": "action_required",
+        "output": {
+            "title": "Análisis de Vulnerabilidades SAST",
+            "summary": f"Se evaluaron hallazgos de seguridad. Revisa las anotaciones adjuntas para ver las remediaciones propuestas.",
+            "annotations": anotaciones
+        }
+    }
+    
+    response = requests.post(url, headers=headers, json=payload)
+    
+    if response.status_code == 201:
+        return f"✅ Anotaciones línea por línea publicadas exitosamente en GitHub. URL del reporte: {response.json().get('html_url')}"
+    else:
+        return f"❌ Fallo al publicar en la Checks API: {response.status_code} - {response.text}"
+
+
 async def _get_agent_tools():
     client = _mcp_client()
-    tools = await client.get_tools() + [query_company_coding_standards]
+    tools = await client.get_tools() + [query_company_coding_standards] + [publicar_anotaciones_de_seguridad]
     logger.info(
         "Tools cargadas (%s): %s",
         len(tools),
@@ -215,7 +339,12 @@ async def _get_agent_tools():
 
 async def _build_agent(system_prompt: str):
     tools = await _get_agent_tools()
-    return create_agent(model=llm, tools=tools, system_prompt=system_prompt)
+    return create_agent(
+        model=llm,
+        tools=tools,
+        system_prompt=_system_prompt_with_rules(system_prompt),
+        middleware=[SingleToolCallMiddleware()],
+    )
 
 
 def _redis_history(session_id: str) -> RedisChatMessageHistory:
