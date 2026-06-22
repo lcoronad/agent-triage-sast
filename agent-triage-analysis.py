@@ -280,25 +280,21 @@ import requests
 from langchain_core.tools import tool
 
 @tool
-def publicar_anotaciones_de_seguridad(owner: str, repo: str, head_sha: str, anotaciones: list) -> str:
+def publicar_comentario_linea_pr(owner: str, repo: str, pr_number: int, commit_id: str, path: str, line: int, recomendacion: str) -> str:
     """
-    Crea un 'Check Run' en GitHub con anotaciones línea por línea para reportar vulnerabilidades en el código.
+    Publica un comentario de seguridad anclado a una línea específica de código en un Pull Request.
     
-    Parámetros requeridos:
-    - owner: El dueño de la organización o repositorio (ej. 'mi-empresa').
-    - repo: El nombre del repositorio (ej. 'frontend-app').
-    - head_sha: El hash del último commit del Pull Request que se está analizando.
-    - anotaciones: Una lista de diccionarios. CADA diccionario debe tener EXACTAMENTE este formato:
-      {
-        "path": "ruta/al/archivo.py",
-        "start_line": numero_de_linea_entero,
-        "end_line": numero_de_linea_entero,
-        "annotation_level": "warning", # Usa "warning" o "failure"
-        "message": "La recomendación técnica y remediación generada por el agente",
-        "title": "CWE-XXX o Nombre de la vulnerabilidad"
-      }
+    Parámetros:
+    - owner: Dueño del repositorio.
+    - repo: Nombre del repositorio.
+    - pr_number: El número del Pull Request.
+    - commit_id: El hash (SHA) del último commit del PR.
+    - path: La ruta del archivo afectado (ej. 'src/app.py').
+    - line: El número de línea vulnerable.
+    - recomendacion: La mitigación generada (Markdown soportado).
     """
-    url = f"https://api.github.com/repos/{owner}/{repo}/check-runs"
+    token = os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN")
+    url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/comments"
     
     headers = {
         "Authorization": f"Bearer {token}",
@@ -307,28 +303,24 @@ def publicar_anotaciones_de_seguridad(owner: str, repo: str, head_sha: str, anot
     }
     
     payload = {
-        "name": "Agente DevSecOps (Qwen-3)",
-        "head_sha": head_sha,
-        "status": "completed",
-        "conclusion": "action_required",
-        "output": {
-            "title": "Análisis de Vulnerabilidades SAST",
-            "summary": f"Se evaluaron hallazgos de seguridad. Revisa las anotaciones adjuntas para ver las remediaciones propuestas.",
-            "annotations": anotaciones
-        }
+        "body": f"🚨 **Alerta de Seguridad (SAST)**\n\n{recomendacion}",
+        "commit_id": commit_id,
+        "path": path,
+        "line": line,
+        "side": "RIGHT"
     }
     
     response = requests.post(url, headers=headers, json=payload)
     
     if response.status_code == 201:
-        return f"✅ Anotaciones línea por línea publicadas exitosamente en GitHub. URL del reporte: {response.json().get('html_url')}"
+        return "✅ Comentario publicado exitosamente en la línea de código."
     else:
-        return f"❌ Fallo al publicar en la Checks API: {response.status_code} - {response.text}"
+        return f"❌ Error {response.status_code}: {response.text}"
 
 
 async def _get_agent_tools():
     client = _mcp_client()
-    tools = await client.get_tools() + [query_company_coding_standards] + [publicar_anotaciones_de_seguridad]
+    tools = await client.get_tools() + [query_company_coding_standards] + [publicar_comentario_linea_pr]
     logger.info(
         "Tools cargadas (%s): %s",
         len(tools),
