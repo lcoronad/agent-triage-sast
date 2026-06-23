@@ -10,11 +10,13 @@ from pydantic import BaseModel
 from langchain.agents import create_agent
 from langchain.agents.middleware import AgentMiddleware
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_milvus import Milvus
 from langchain_redis import RedisChatMessageHistory
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_mcp_adapters.client import MultiServerMCPClient
+from pymilvus import MilvusClient
+from typing import List
+from langchain_core.embeddings import Embeddings
 
 load_dotenv()
 
@@ -188,14 +190,23 @@ github_tool_url = os.getenv("GITHUB_TOOL_URL", "http://cluster.local")
 milvus_host = os.getenv("MILVUS_HOST", "milvus-service")
 milvus_port = os.getenv("MILVUS_PORT", "19530")
 milvus_collection_name = os.getenv("MILVUS_COLLECTION_NAME", "company_coding_standards")
-milvus_uri = "http://" + milvus_host + ":" + milvus_port
+milvus_search_limit = int(os.getenv("MILVUS_SEARCH_LIMIT", "3"))
+milvus_metric_type = os.getenv("MILVUS_METRIC_TYPE", "L2")
 
 triage_system_prompt = os.getenv(
     "TRIAGE_SYSTEM_PROMPT",
     (
-        "Eres un agente DevSecOps experto en análisis de vulnerabilidades y remediación de código. "
-        "Usa las herramientas MCP de GitHub y Slack, y consulta las normas internas de codificación "
-        "cuando necesites validar lineamientos de la empresa."
+        "Eres un agente DevSecOps experto en triage de vulnerabilidades. Debes analizar "
+        "SIEMPRE los dos tipos de hallazgos del PR:\n"
+        "1) TRIVY (SCA/dependencias): vulnerabilidades en librerías sin línea de código.\n"
+        "2) OPENGREP (SAST/código): hallazgos con archivo y número de línea.\n\n"
+        "Reglas de publicación en GitHub:\n"
+        "- TRIVY → publicar_comentario_general_pr: un comentario consolidado en el PR.\n"
+        "- OPENGREP → publicar_comentario_linea_pr: UN comentario por cada hallazgo, "
+        "anclado a su línea (path, line, commit_id).\n"
+        "- Usa query_company_coding_standards con CVE/CWE/rule_id para enriquecer remediaciones.\n"
+        "- NO finalices hasta publicar comentarios para TODOS los hallazgos del checklist.\n"
+        "- Invoca como máximo UNA herramienta por turno."
     ),
 )
 slack_system_prompt = os.getenv(
@@ -209,15 +220,26 @@ slack_system_prompt = os.getenv(
 triage_user_prompt_template = os.getenv(
     "TRIAGE_USER_PROMPT",
     (
-        "Analiza estos reportes: TRIVY: {trivy_json} y OPENGREP: {opengrep_sarif}.\n"
-        "1. Genera soluciones específicas de remediación lo más detalladas posible "
-        "y usa la herramienta de query_company_coding_standards para dar mayor explicacion.\n"
-        "2. Comenta el detalle de las remediaciones en el repositorio '{repo_path}' "
-        "PR '{pull_request_number}' usando la herramienta de github_comment.\n"
-        "3. Envía una notificación de fin de análisis a Slack indicando que el análisis "
-        "ha finalizado usando la herramienta de slack_message.\n"
-        "Ejecuta los pasos de forma secuencial: una herramienta por turno, "
-        "esperando el resultado antes de continuar."
+        "Analiza TODOS los hallazgos de TRIVY y OPENGREP del PR. No omitas ninguno.\n\n"
+        "## Contexto\n"
+        "- Repositorio: {repo_path}\n"
+        "- Owner: {repo_owner}\n"
+        "- Repo: {repo_name}\n"
+        "- PR: {pull_request_number}\n"
+        "- Commit: {commit_id}\n\n"
+        "## Checklist obligatorio\n"
+        "{findings_checklist}\n\n"
+        "## Flujo (una herramienta por turno)\n"
+        "1. Consulta query_company_coding_standards por CVE/CWE/rule_id relevantes.\n"
+        "2. Publica comentario general TRIVY con publicar_comentario_general_pr "
+        "(owner={repo_owner}, repo={repo_name}, pr_number={pull_request_number}).\n"
+        "3. Por CADA hallazgo OPENGREP del checklist, publica comentario de línea con "
+        "publicar_comentario_linea_pr (owner, repo, pr_number, commit_id={commit_id}, "
+        "path, line, recomendacion).\n"
+        "4. Notifica fin de análisis en Slack con slack_post_message.\n\n"
+        "## Reportes completos\n"
+        "TRIVY: {trivy_json}\n"
+        "OPENGREP: {opengrep_sarif}"
     ),
 )
 slack_user_prompt_template = os.getenv(
@@ -241,16 +263,82 @@ llm = ChatOpenAI(
     max_completion_tokens=max_completion_tokens,
 )
 
-embeddings = OpenAIEmbeddings(
-    model=embedding_model,
-    openai_api_base=embedding_base_url,
-    openai_api_key=embedding_api_key,
+class LlamaStackGraniteEmbeddings(Embeddings):
+    """
+    Adaptador personalizado para enviar textos puros a Llama Stack,
+    evitando los bugs de arrays del SDK de OpenAI.
+    """
+
+    def __init__(self, base_url: str, model: str):
+        self.base_url = base_url
+        self.model = model
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        vectores = []
+        # Enviamos los textos uno por uno como strings puros
+        for text in texts:
+            # Aseguramos que sea un string válido
+            texto_limpio = str(text).strip()
+            payload = {
+                "model": self.model,
+                "input": texto_limpio
+            }
+            response = requests.post(
+                f"{self.base_url}/embeddings",  # Endpoint /v1/embeddings
+                json=payload,
+                headers={"Content-Type": "application/json"}
+            )
+            # Si hay un error HTTP, nos lo mostrará claramente
+            response.raise_for_status() 
+            # Extraemos el vector de la respuesta de Llama Stack
+            vector = response.json()["data"][0]["embedding"]
+            vectores.append(vector)
+        return vectores
+
+    def embed_query(self, text: str) -> List[float]:
+        # Para LangChain, un query es solo un documento de 1 elemento
+        return self.embed_documents([text])[0]
+
+
+embeddings = LlamaStackGraniteEmbeddings(
+    model=embedding_model, 
+    base_url=embedding_base_url
 )
-vector_store = Milvus(
-    embedding_function=embeddings,
-    connection_args={"uri": milvus_uri},
-    collection_name=milvus_collection_name,
-)
+
+
+def _milvus_uri() -> str:
+    explicit = os.getenv("MILVUS_URI", "").strip()
+    if explicit:
+        return explicit
+
+    host = milvus_host.strip()
+    port = milvus_port.strip()
+    if host.startswith(("http://", "https://")):
+        return host if host.endswith(f":{port}") else f"{host.rstrip('/')}:{port}"
+    return f"http://{host}:{port}"
+
+
+def _search_company_standards(query: str) -> list[str]:
+    """Consulta Milvus creando conexión local (seguro en threads de LangGraph)."""
+    milvus_client = MilvusClient(uri=_milvus_uri())
+    query_vector = embeddings.embed_query(query)
+    results = milvus_client.search(
+        collection_name=milvus_collection_name,
+        data=[query_vector],
+        limit=milvus_search_limit,
+        search_params={"metric_type": milvus_metric_type, "params": {}},
+        output_fields=["text"],
+    )
+
+    if not results or not results[0]:
+        return []
+
+    chunks: list[str] = []
+    for hit in results[0]:
+        text = hit.get("entity", {}).get("text", "")
+        if text:
+            chunks.append(text)
+    return chunks
 
 
 def _mcp_client() -> MultiServerMCPClient:
@@ -271,29 +359,23 @@ def _mcp_client() -> MultiServerMCPClient:
 @tool
 def query_company_coding_standards(query: str) -> str:
     """Útil para buscar lineamientos de codificación segura de la empresa."""
-    docs = vector_store.similarity_search(query, k=3)
-    return "\n\n".join([f"[Norma]: {d.page_content}" for d in docs])
+    try:
+        docs = _search_company_standards(query)
+        if not docs:
+            return "No se encontraron normas internas relacionadas con la consulta."
+        return "\n\n".join(f"[Norma]: {doc}" for doc in docs)
+    except Exception as exc:
+        logger.exception("Error consultando Milvus para query=%s", query)
+        return f"Error al consultar normas en Milvus: {exc}"
 
-
-import os
-import requests
-from langchain_core.tools import tool
 
 @tool
 def publicar_comentario_linea_pr(owner: str, repo: str, pr_number: int, commit_id: str, path: str, line: int, recomendacion: str) -> str:
     """
-    Publica un comentario de seguridad anclado a una línea específica de código en un Pull Request.
-    
-    Parámetros:
-    - owner: Dueño del repositorio.
-    - repo: Nombre del repositorio.
-    - pr_number: El número del Pull Request.
-    - commit_id: El hash (SHA) del último commit del PR.
-    - path: La ruta del archivo afectado (ej. 'src/app.py').
-    - line: El número de línea vulnerable.
-    - recomendacion: La mitigación generada (Markdown soportado).
+    Publica un comentario SAST anclado a UNA línea de código (hallazgos OPENGREP/SARIF).
+    Obligatorio para cada hallazgo OpenGrep con archivo y línea.
+    Usar path relativo al repo (ej. src/main/java/.../UserResource.java), sin prefijo del nombre del repo.
     """
-    token = os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN")
     url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/comments"
     
     headers = {
@@ -314,13 +396,55 @@ def publicar_comentario_linea_pr(owner: str, repo: str, pr_number: int, commit_i
     
     if response.status_code == 201:
         return "✅ Comentario publicado exitosamente en la línea de código."
+    elif response.status_code == 422 and "could not be resolved" in response.text:
+        print(f"⚠️ La línea {line} no está en el diff del PR. Usando Fallback a comentario general...")
+        
+        url_general = f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments"
+        payload_general = {
+            "body": f"🚨 **Alerta de Seguridad (SAST) - Código Preexistente**\n\n"
+                    f"📍 *Se detectó una vulnerabilidad en el archivo `{path}` en la línea `{line}`, pero esta línea no fue modificada en este PR.*\n\n"
+                    f"{recomendacion}"
+        }
+        
+        fallback_resp = requests.post(url_general, headers=headers, json=payload_general)
+        if fallback_resp.status_code == 201:
+            return "✅ El comentario no pudo anclarse a la línea (fuera del diff), pero se publicó exitosamente como comentario general en el PR."
+        else:
+            return f"❌ Error crítico en el Fallback: {fallback_resp.status_code} - {fallback_resp.text}"
+    else:
+        return f"❌ Error {response.status_code}: {response.text}"
+
+
+@tool
+def publicar_comentario_general_pr(owner: str, repo: str, pr_number: int, vulnerabilidades_md: str) -> str:
+    """
+    Publica UN comentario general en el PR para hallazgos TRIVY (dependencias/SCA).
+    No usar para OpenGrep; esos van con publicar_comentario_linea_pr.
+    """
+    
+    # Nota: Para GitHub, los comentarios generales de un PR se hacen en el endpoint de "issues"
+    url = f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments"
+    
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+    
+    payload = {
+        "body": f"📦 **Alerta de Seguridad en Dependencias (SCA)**\n\n{vulnerabilidades_md}"
+    }
+    
+    response = requests.post(url, headers=headers, json=payload)
+    
+    if response.status_code == 201:
+        return "✅ Comentario general de dependencias publicado exitosamente."
     else:
         return f"❌ Error {response.status_code}: {response.text}"
 
 
 async def _get_agent_tools():
     client = _mcp_client()
-    tools = await client.get_tools() + [query_company_coding_standards] + [publicar_comentario_linea_pr]
+    tools = await client.get_tools() + [query_company_coding_standards] + [publicar_comentario_linea_pr] + [publicar_comentario_general_pr]
     logger.info(
         "Tools cargadas (%s): %s",
         len(tools),
@@ -436,11 +560,151 @@ def _persist_slack_turn(
 class TriageRequest(BaseModel):
     repo_path: str
     pull_request_number: str
+    repo_owner: str
+    commit_id: str
     trivy_json: dict
     opengrep_sarif: dict
 
 
+def _split_repo_path(repo_path: str, repo_owner: str) -> tuple[str, str]:
+    if "/" in repo_path:
+        owner, repo = repo_path.split("/", 1)
+        return owner, repo
+    return repo_owner, repo_path
+
+
+def _normalize_repo_file_path(path: str, repo_name: str) -> str:
+    normalized = path.lstrip("./")
+    prefix = f"{repo_name}/"
+    if normalized.startswith(prefix):
+        return normalized[len(prefix) :]
+    return normalized
+
+
+def _extract_trivy_findings(trivy_json: dict) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    for result in trivy_json.get("Results", []):
+        target = result.get("Target", "")
+        for vuln in result.get("Vulnerabilities", []) or []:
+            findings.append(
+                {
+                    "id": vuln.get("VulnerabilityID", "UNKNOWN"),
+                    "pkg": vuln.get("PkgName", ""),
+                    "severity": vuln.get("Severity", ""),
+                    "target": target,
+                    "fixed_version": vuln.get("FixedVersion", ""),
+                    "description": vuln.get("Description", vuln.get("Title", "")),
+                }
+            )
+    return findings
+
+
+def _opengrep_result_line(result: dict[str, Any]) -> int | None:
+    start = result.get("start") or {}
+    if isinstance(start, dict) and start.get("line") is not None:
+        return int(start["line"])
+
+    locations = result.get("locations") or []
+    if locations:
+        region = locations[0].get("physicalLocation", {}).get("region", {})
+        if region.get("startLine") is not None:
+            return int(region["startLine"])
+    return None
+
+
+def _opengrep_result_path(result: dict[str, Any]) -> str:
+    if result.get("path"):
+        return str(result["path"])
+
+    locations = result.get("locations") or []
+    if locations:
+        uri = locations[0].get("physicalLocation", {}).get("artifactLocation", {}).get("uri", "")
+        if uri:
+            return str(uri)
+    return ""
+
+
+def _opengrep_result_message(result: dict[str, Any]) -> str:
+    extra = result.get("extra") or {}
+    if extra.get("message"):
+        return str(extra["message"])
+    message = result.get("message") or {}
+    if isinstance(message, dict) and message.get("text"):
+        return str(message["text"])
+    return str(message or "")
+
+
+def _extract_opengrep_findings(opengrep_sarif: dict) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    for run in opengrep_sarif.get("runs", []):
+        for result in run.get("results", []) or []:
+            rule_id = result.get("check_id") or result.get("ruleId") or "UNKNOWN"
+            extra = result.get("extra") or {}
+            metadata = extra.get("metadata") or {}
+            cwe_list = metadata.get("cwe") or []
+            findings.append(
+                {
+                    "rule_id": rule_id,
+                    "path": _opengrep_result_path(result),
+                    "line": _opengrep_result_line(result),
+                    "severity": extra.get("severity") or result.get("level", ""),
+                    "message": _opengrep_result_message(result),
+                    "cwe": cwe_list[0] if cwe_list else "",
+                }
+            )
+    return findings
+
+
+def _build_findings_checklist(data: TriageRequest) -> str:
+    owner, repo_name = _split_repo_path(data.repo_path, data.repo_owner)
+    trivy_findings = _extract_trivy_findings(data.trivy_json)
+    opengrep_findings = _extract_opengrep_findings(data.opengrep_sarif)
+
+    lines = [
+        f"Owner={owner}, Repo={repo_name}, PR={data.pull_request_number}, Commit={data.commit_id}",
+        "",
+        f"### TRIVY ({len(trivy_findings)} hallazgos) → publicar_comentario_general_pr",
+    ]
+
+    if trivy_findings:
+        for idx, finding in enumerate(trivy_findings, start=1):
+            lines.append(
+                f"{idx}. [{finding['severity']}] {finding['id']} en {finding['pkg']} "
+                f"(target: {finding['target']}) → remediar a {finding['fixed_version'] or 'ver advisory'}"
+            )
+    else:
+        lines.append("- Sin hallazgos Trivy.")
+
+    lines.append("")
+    lines.append(
+        f"### OPENGREP ({len(opengrep_findings)} hallazgos) → publicar_comentario_linea_pr (uno por hallazgo)"
+    )
+
+    if opengrep_findings:
+        for idx, finding in enumerate(opengrep_findings, start=1):
+            path = _normalize_repo_file_path(finding["path"], repo_name)
+            line = finding["line"] if finding["line"] is not None else "?"
+            lines.append(
+                f"{idx}. [{finding['severity']}] {finding['rule_id']} "
+                f"en {path}:{line} — {finding['message']}"
+            )
+            lines.append(
+                f"   → publicar_comentario_linea_pr(owner={owner}, repo={repo_name}, "
+                f"pr_number={data.pull_request_number}, commit_id={data.commit_id}, "
+                f"path={path}, line={line}, recomendacion=...)"
+            )
+    else:
+        lines.append("- Sin hallazgos OpenGrep.")
+
+    lines.append("")
+    lines.append(
+        "IMPORTANTE: Debes publicar comentarios para TODOS los hallazgos anteriores antes de notificar en Slack."
+    )
+    return "\n".join(lines)
+
+
 def _build_triage_prompt(data: TriageRequest) -> str:
+    owner, repo_name = _split_repo_path(data.repo_path, data.repo_owner)
     return triage_user_prompt_template.format(
         trivy_json=json.dumps(data.trivy_json, ensure_ascii=False)[:TRIVY_JSON_MAX_CHARS],
         opengrep_sarif=json.dumps(data.opengrep_sarif, ensure_ascii=False)[
@@ -448,6 +712,10 @@ def _build_triage_prompt(data: TriageRequest) -> str:
         ],
         repo_path=data.repo_path,
         pull_request_number=data.pull_request_number,
+        repo_owner=owner,
+        repo_name=repo_name,
+        commit_id=data.commit_id,
+        findings_checklist=_build_findings_checklist(data),
     )
 
 
@@ -461,6 +729,15 @@ def _build_slack_prompt(event: dict, channel: str, thread_ts: str) -> str:
 
 async def process_async_triage(data: TriageRequest):
     try:
+        trivy_count = len(_extract_trivy_findings(data.trivy_json))
+        opengrep_count = len(_extract_opengrep_findings(data.opengrep_sarif))
+        logger.info(
+            "Iniciando triage repo=%s pr=%s | hallazgos trivy=%s opengrep=%s",
+            data.repo_path,
+            data.pull_request_number,
+            trivy_count,
+            opengrep_count,
+        )
         agent = await _build_agent(triage_system_prompt)
         prompt = _build_triage_prompt(data)
         await _run_agent(
