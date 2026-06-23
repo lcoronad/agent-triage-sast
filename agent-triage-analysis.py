@@ -193,19 +193,122 @@ milvus_collection_name = os.getenv("MILVUS_COLLECTION_NAME", "company_coding_sta
 milvus_search_limit = int(os.getenv("MILVUS_SEARCH_LIMIT", "3"))
 milvus_metric_type = os.getenv("MILVUS_METRIC_TYPE", "L2")
 
+_DEFAULT_GITHUB_REMEDIATION_GUIDE = """
+## Plantillas obligatorias para comentarios en GitHub (Markdown)
+
+Usa español técnico, tono profesional y contenido accionable. NO publiques listas sueltas;
+cada hallazgo debe tener secciones completas.
+
+### A) TRIVY → publicar_comentario_general_pr (UN comentario consolidado)
+
+Estructura mínima del campo `vulnerabilidades_md`:
+
+## Resumen ejecutivo SCA (Trivy)
+- Total hallazgos: N
+- Críticos: X | Altos: Y | Medios: Z | Bajos: W
+- Acción prioritaria: (1-2 frases)
+
+## Tabla de dependencias afectadas
+| Severidad | ID | Paquete | Versión instalada | Versión corregida | Archivo/Target |
+|-----------|----|---------|-------------------|-------------------|----------------|
+| CRITICAL  | CVE-... | ... | ... | ... | pom.xml |
+
+## Detalle por vulnerabilidad
+
+### [SEVERIDAD] CVE-XXXX — nombre-paquete
+**Target:** archivo o imagen afectada
+
+**Descripción:** Qué es la vulnerabilidad y por qué aplica aquí.
+
+**Impacto:** Riesgo concreto para esta aplicación (confidencialidad, integridad, disponibilidad).
+
+**Remediación:**
+1. Paso concreto (actualizar versión, reemplazar dependencia, etc.)
+2. Verificar compatibilidad / breaking changes si aplica
+3. Re-ejecutar escaneo Trivy tras el cambio
+
+**Comando o cambio sugerido:**
+```xml
+<!-- fragmento pom.xml / package.json / etc. con versión corregida -->
+```
+
+**Referencias:**
+- Enlace NVD/advisory si está en el reporte
+- Norma interna (si query_company_coding_standards aportó contexto)
+
+**Validación:**
+- [ ] Dependencia actualizada en el manifest lockfile
+- [ ] Build/test exitoso
+- [ ] Trivy sin el CVE en el target afectado
+
+---
+
+(repetir bloque ### por CADA CVE de Trivy)
+
+### B) OPENGREP → publicar_comentario_linea_pr (UN comentario POR hallazgo)
+
+Estructura mínima del campo `recomendacion` (Markdown):
+
+### [SEVERIDAD] rule_id — CWE-XXX
+
+**Ubicación:** `ruta/archivo.ext:LINEA`
+
+**Problema detectado:** Explica la línea/patrón inseguro en lenguaje claro.
+
+**Riesgo / impacto:** Qué puede explotar un atacante (ej. RCE, SQLi, filtrado de datos).
+
+**Causa raíz:** Por qué el código actual es vulnerable.
+
+**Remediación recomendada:**
+1. Cambio específico a aplicar
+2. Buenas prácticas (validación, parametrización, allowlist, etc.)
+3. Controles adicionales si aplica (tests, lint, SAST en CI)
+
+**Código sugerido:**
+```java
+// ❌ Código vulnerable (resumen)
+// ✅ Código corregido (fragmento concreto)
+```
+
+**Referencias:**
+- CWE / rule_id
+- Norma interna relevante (Milvus) si la consultaste
+
+**Validación:**
+- [ ] Corrección aplicada en la línea o bloque afectado
+- [ ] Prueba unitaria o caso negativo añadido si aplica
+- [ ] OpenGrep/SAST sin re-detectar el hallazgo
+
+### Reglas de calidad
+- Integra SIEMPRE datos del reporte (CVE, paquete, versión, rule_id, path, line, mensaje).
+- Enriquece con query_company_coding_standards antes de redactar (una consulta por turno).
+- Prioriza remediaciones prácticas para el lenguaje/framework del repo.
+- Si falta fixedVersion en Trivy, indica mitigación alternativa (workaround, compensating control).
+- No inventes URLs; usa solo referencias presentes en el reporte o normas internas.
+""".strip()
+
+github_remediation_guide = os.getenv(
+    "GITHUB_REMEDIATION_GUIDE",
+    _DEFAULT_GITHUB_REMEDIATION_GUIDE,
+)
+
 triage_system_prompt = os.getenv(
     "TRIAGE_SYSTEM_PROMPT",
     (
-        "Eres un agente DevSecOps experto en triage de vulnerabilidades. Debes analizar "
-        "SIEMPRE los dos tipos de hallazgos del PR:\n"
-        "1) TRIVY (SCA/dependencias): vulnerabilidades en librerías sin línea de código.\n"
-        "2) OPENGREP (SAST/código): hallazgos con archivo y número de línea.\n\n"
-        "Reglas de publicación en GitHub:\n"
-        "- TRIVY → publicar_comentario_general_pr: un comentario consolidado en el PR.\n"
-        "- OPENGREP → publicar_comentario_linea_pr: UN comentario por cada hallazgo, "
-        "anclado a su línea (path, line, commit_id).\n"
-        "- Usa query_company_coding_standards con CVE/CWE/rule_id para enriquecer remediaciones.\n"
-        "- NO finalices hasta publicar comentarios para TODOS los hallazgos del checklist.\n"
+        "Eres un agente DevSecOps experto en triage y remediación de vulnerabilidades.\n\n"
+        "Debes analizar SIEMPRE ambas fuentes:\n"
+        "1) TRIVY (SCA/dependencias) — sin línea de código.\n"
+        "2) OPENGREP (SAST/código) — con archivo y línea.\n\n"
+        "Publicación en GitHub:\n"
+        "- TRIVY → publicar_comentario_general_pr: UN comentario consolidado, "
+        "estructurado con tabla + detalle por CVE (ver GITHUB_REMEDIATION_GUIDE).\n"
+        "- OPENGREP → publicar_comentario_linea_pr: UN comentario POR hallazgo, "
+        "con remediación detallada y código sugerido (ver GITHUB_REMEDIATION_GUIDE).\n\n"
+        "Calidad de remediación:\n"
+        "- Consulta query_company_coding_standards por CVE, CWE o rule_id antes de redactar.\n"
+        "- Incluye impacto, pasos concretos, fragmento de código/config y checklist de validación.\n"
+        "- No uses bullets genéricos; cada hallazgo lleva secciones completas.\n"
+        "- NO finalices hasta publicar comentarios para TODOS los ítems del checklist.\n"
         "- Invoca como máximo UNA herramienta por turno."
     ),
 )
@@ -230,13 +333,16 @@ triage_user_prompt_template = os.getenv(
         "## Checklist obligatorio\n"
         "{findings_checklist}\n\n"
         "## Flujo (una herramienta por turno)\n"
-        "1. Consulta query_company_coding_standards por CVE/CWE/rule_id relevantes.\n"
-        "2. Publica comentario general TRIVY con publicar_comentario_general_pr "
+        "1. Consulta query_company_coding_standards (CVE, CWE o rule_id) para enriquecer contexto.\n"
+        "2. Redacta comentario SCA estructurado y publícalo con publicar_comentario_general_pr "
         "(owner={repo_owner}, repo={repo_name}, pr_number={pull_request_number}).\n"
-        "3. Por CADA hallazgo OPENGREP del checklist, publica comentario de línea con "
+        "   El campo vulnerabilidades_md DEBE seguir la plantilla TRIVY de GITHUB_REMEDIATION_GUIDE.\n"
+        "3. Por CADA hallazgo OPENGREP: redacta recomendacion con plantilla SAST y publica con "
         "publicar_comentario_linea_pr (owner, repo, pr_number, commit_id={commit_id}, "
         "path, line, recomendacion).\n"
-        "4. Notifica fin de análisis en Slack con slack_post_message.\n\n"
+        "4. Notifica fin de análisis en Slack (resumen: total Trivy, total OpenGrep, acciones).\n\n"
+        "## Guía de formato para GitHub\n"
+        "{github_remediation_guide}\n\n"
         "## Reportes completos\n"
         "TRIVY: {trivy_json}\n"
         "OPENGREP: {opengrep_sarif}"
@@ -372,9 +478,11 @@ def query_company_coding_standards(query: str) -> str:
 @tool
 def publicar_comentario_linea_pr(owner: str, repo: str, pr_number: int, commit_id: str, path: str, line: int, recomendacion: str) -> str:
     """
-    Publica un comentario SAST anclado a UNA línea de código (hallazgos OPENGREP/SARIF).
-    Obligatorio para cada hallazgo OpenGrep con archivo y línea.
-    Usar path relativo al repo (ej. src/main/java/.../UserResource.java), sin prefijo del nombre del repo.
+    Publica comentario SAST inline (OPENGREP) en el PR.
+
+    El campo `recomendacion` debe ser Markdown estructurado con:
+    Problema detectado, Riesgo/impacto, Causa raíz, Remediación (pasos),
+    Código sugerido (bloque ```), Referencias (CWE/rule_id/normas) y Validación (checklist).
     """
     url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/comments"
     
@@ -418,8 +526,11 @@ def publicar_comentario_linea_pr(owner: str, repo: str, pr_number: int, commit_i
 @tool
 def publicar_comentario_general_pr(owner: str, repo: str, pr_number: int, vulnerabilidades_md: str) -> str:
     """
-    Publica UN comentario general en el PR para hallazgos TRIVY (dependencias/SCA).
-    No usar para OpenGrep; esos van con publicar_comentario_linea_pr.
+    Publica comentario general SCA (TRIVY) en el PR.
+
+    El campo `vulnerabilidades_md` debe incluir: resumen ejecutivo, tabla de CVEs,
+    y bloque detallado por CVE (descripción, impacto, remediación, cambio sugerido,
+    referencias y checklist de validación). Ver GITHUB_REMEDIATION_GUIDE.
     """
     
     # Nota: Para GitHub, los comentarios generales de un PR se hacen en el endpoint de "issues"
@@ -697,14 +808,24 @@ def _build_findings_checklist(data: TriageRequest) -> str:
         lines.append("- Sin hallazgos OpenGrep.")
 
     lines.append("")
+    lines.append("### Formato esperado en GitHub")
+    lines.append("- TRIVY: resumen + tabla + detalle por CVE con remediación y validación.")
     lines.append(
-        "IMPORTANTE: Debes publicar comentarios para TODOS los hallazgos anteriores antes de notificar en Slack."
+        "- OPENGREP: un comentario por hallazgo con impacto, causa, fix, código sugerido y validación."
+    )
+    lines.append("")
+    lines.append(
+        "IMPORTANTE: Debes publicar comentarios para TODOS los hallazgos anteriores antes de Slack."
     )
     return "\n".join(lines)
 
 
 def _build_triage_prompt(data: TriageRequest) -> str:
     owner, repo_name = _split_repo_path(data.repo_path, data.repo_owner)
+    guide = github_remediation_guide
+    if "{github_remediation_guide}" not in triage_user_prompt_template:
+        guide = ""
+
     return triage_user_prompt_template.format(
         trivy_json=json.dumps(data.trivy_json, ensure_ascii=False)[:TRIVY_JSON_MAX_CHARS],
         opengrep_sarif=json.dumps(data.opengrep_sarif, ensure_ascii=False)[
@@ -716,6 +837,7 @@ def _build_triage_prompt(data: TriageRequest) -> str:
         repo_name=repo_name,
         commit_id=data.commit_id,
         findings_checklist=_build_findings_checklist(data),
+        github_remediation_guide=guide or github_remediation_guide,
     )
 
 
