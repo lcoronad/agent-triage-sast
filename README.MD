@@ -59,3 +59,12 @@ podman tag localhost/agent-triage-sast quay.io/${ORGANIZATION_QUAY}/agent-triage
 ```bash
 podman push quay.io/${ORGANIZATION_QUAY}/agent-triage-sast:${VERSION}
 ```
+
+
+oc new-build --name=opengrep-scan --binary=true --strategy=docker -n triage-analysis-sast
+oc start-build opengrep-scan --from-dir ./ --wait -n triage-analysis-sast
+oc tag opengrep-scan:latest opengrep-scan:1.0.0 -n triage-analysis-sast
+
+oc new-build --name=consume-agent --binary=true --strategy=docker -n triage-analysis-sast
+oc start-build consume-agent --from-dir ./ --wait -n triage-analysis-sast
+oc tag consume-agent:latest consume-agent:1.0.0 -n triage-analysis-sast
