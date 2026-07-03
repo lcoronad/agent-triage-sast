@@ -1,8 +1,11 @@
 import logging
 import os
 import json
+import uuid
+import re
 import requests
 from typing import Any, Sequence
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, BackgroundTasks, Request
@@ -111,8 +114,301 @@ def _log_message(message: BaseMessage, context: str) -> None:
     logger.info("[%s] %s: %s", context, message.__class__.__name__, _truncate_text(content))
 
 
+_GITHUB_TOOLS = frozenset(
+    {"publicar_comentario_general_pr", "publicar_comentario_linea_pr"}
+)
+
+
+def _split_repo_path(repo_path: str, repo_owner: str) -> tuple[str, str]:
+    path = repo_path.strip().rstrip("/").removesuffix(".git")
+    if path.startswith("//"):
+        path = f"https:{path}"
+    if not path.startswith(("http://", "https://", "git@")) and "github.com/" in path:
+        path = f"https://{path.lstrip('/')}"
+
+    if path.startswith(("http://", "https://")):
+        segments = [segment for segment in urlparse(path).path.split("/") if segment]
+        if len(segments) >= 2:
+            return segments[-2], segments[-1]
+
+    if path.startswith("git@"):
+        _, _, rest = path.partition(":")
+        segments = [segment for segment in rest.split("/") if segment]
+        if len(segments) >= 2:
+            return segments[-2], segments[-1]
+
+    segments = [
+        segment
+        for segment in path.split("/")
+        if segment and segment not in {"github.com", "https:", "http:"}
+    ]
+    if len(segments) >= 2:
+        return segments[-2], segments[-1]
+    if len(segments) == 1 and repo_owner:
+        return repo_owner, segments[0]
+
+    return repo_owner, path
+
+
+def _normalize_github_owner_repo(owner: str, repo: str, fallback_owner: str = "") -> tuple[str, str]:
+    owner = (owner or "").strip()
+    repo = (repo or "").strip()
+
+    if "github.com" in repo or repo.startswith(("http://", "https://", "//")):
+        return _split_repo_path(repo, fallback_owner or owner)
+
+    if owner in {"https:", "http:"} or owner.startswith(("http://", "https://")):
+        combined = repo
+        if combined.startswith("//"):
+            combined = f"https:{combined}"
+        elif combined.startswith("/"):
+            combined = f"https://{combined.lstrip('/')}"
+        elif not combined.startswith("http"):
+            combined = f"{owner.rstrip(':')}//{repo.lstrip('/')}"
+        return _split_repo_path(combined, fallback_owner)
+
+    if "/" in repo and not repo.startswith("http"):
+        parsed_owner, parsed_repo = repo.split("/", 1)
+        return parsed_owner, parsed_repo.removesuffix(".git")
+
+    clean_owner = owner if owner not in {"https:", "http:"} else fallback_owner
+    return clean_owner, repo.removesuffix(".git")
+
+
+def _normalize_github_tool_args(tool_call: dict[str, Any], fallback_owner: str = "") -> None:
+    if tool_call.get("name") not in _GITHUB_TOOLS:
+        return
+
+    args = tool_call.setdefault("args", {})
+    owner, repo = _normalize_github_owner_repo(
+        str(args.get("owner", "")),
+        str(args.get("repo", "")),
+        fallback_owner,
+    )
+    args["owner"] = owner
+    args["repo"] = repo
+
+
+def _strip_code_fence(content: str) -> str:
+    content = content.strip()
+    if not content.startswith("```"):
+        return content
+
+    lines = content.split("\n")
+    if lines[-1].strip() == "```":
+        return "\n".join(lines[1:-1]).strip()
+    return "\n".join(lines[1:]).strip()
+
+
+def _extract_json_object_candidate(content: str) -> str:
+    content = _strip_code_fence(content)
+    if content.startswith("{"):
+        return content
+
+    for marker in ('{"type"', '{"name"', '{"function"'):
+        idx = content.find(marker)
+        if idx != -1:
+            return content[idx:]
+    return content
+
+
+def _decode_json_string_body(raw: str, *, allow_truncated: bool) -> str:
+    out: list[str] = []
+    i = 0
+    while i < len(raw):
+        ch = raw[i]
+        if ch == '"' and not allow_truncated:
+            break
+        if ch == '"' and allow_truncated:
+            ahead = raw[i + 1 :].lstrip()
+            if ahead.startswith((",", "}")):
+                break
+        if ch == "\\" and i + 1 < len(raw):
+            nxt = raw[i + 1]
+            escapes = {
+                "n": "\n",
+                "r": "\r",
+                "t": "\t",
+                '"': '"',
+                "\\": "\\",
+                "/": "/",
+            }
+            if nxt in escapes:
+                out.append(escapes[nxt])
+                i += 2
+                continue
+            if nxt == "u" and i + 5 < len(raw):
+                try:
+                    out.append(chr(int(raw[i + 2 : i + 6], 16)))
+                    i += 6
+                    continue
+                except ValueError:
+                    pass
+        out.append(ch)
+        i += 1
+
+    text = "".join(out).rstrip("\\")
+    if allow_truncated and text and "informe truncado" not in text.lower():
+        text += "\n\n> Nota: informe truncado por límite de respuesta del modelo."
+    return text
+
+
+def _parse_text_tool_call_lenient(content: str) -> tuple[str, dict[str, Any]] | None:
+    content = _extract_json_object_candidate(content)
+    name_match = re.search(r'"name"\s*:\s*"([^"]+)"', content)
+    if not name_match:
+        function_match = re.search(
+            r'"function"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"',
+            content,
+        )
+        if not function_match:
+            return None
+        name = function_match.group(1)
+    else:
+        name = name_match.group(1)
+
+    args: dict[str, Any] = {}
+    for key in (
+        "owner",
+        "repo",
+        "channel",
+        "thread_ts",
+        "path",
+        "file_path",
+        "rule_id",
+        "cve_id",
+        "message",
+        "body",
+        "text",
+    ):
+        match = re.search(rf'"{re.escape(key)}"\s*:\s*"([^"]*)"', content)
+        if match:
+            args[key] = match.group(1)
+
+    pr_match = re.search(r'"pr_number"\s*:\s*"?([^",}\s]+)"?', content)
+    if pr_match:
+        args["pr_number"] = pr_match.group(1)
+
+    line_match = re.search(r'"line(?:_number)?"\s*:\s*(\d+)', content)
+    if line_match:
+        args["line"] = int(line_match.group(1))
+
+    for long_field in ("vulnerabilidades_md", "comment", "markdown"):
+        field_match = re.search(rf'"{re.escape(long_field)}"\s*:\s*"', content)
+        if not field_match:
+            continue
+        body = content[field_match.end() :]
+        tail = body.rstrip()
+        truncated = not tail.endswith(('"', '"}', '",'))
+        args[long_field] = _decode_json_string_body(body, allow_truncated=truncated)
+
+    if name in _GITHUB_TOOLS:
+        if not all(args.get(key) for key in ("owner", "repo", "pr_number")):
+            return None
+        if not args.get("vulnerabilidades_md"):
+            return None
+
+    if not args:
+        return None
+    return name, args
+
+
+def _apply_text_tool_call(
+    messages: list[BaseMessage],
+    last: AIMessage,
+    name: str,
+    args: dict[str, Any],
+    fallback_owner: str = "",
+) -> AIMessage:
+    tool_call = {
+        "id": f"call_{uuid.uuid4().hex[:12]}",
+        "name": name,
+        "args": args or {},
+        "type": "tool_call",
+    }
+    _normalize_github_tool_args(tool_call, fallback_owner)
+    new_ai = AIMessage(
+        content="",
+        tool_calls=[tool_call],
+        id=last.id,
+        response_metadata=getattr(last, "response_metadata", {}) or {},
+    )
+    messages[-1] = new_ai
+    logger.warning(
+        "Tool-call en texto convertida a invocación estructurada: %s",
+        name,
+    )
+    return new_ai
+
+
+def _coerce_text_tool_calls(
+    messages: list[BaseMessage],
+    fallback_owner: str = "",
+) -> AIMessage | None:
+    if not messages:
+        return False
+
+    last = messages[-1]
+    if not isinstance(last, AIMessage) or last.tool_calls:
+        return None
+
+    content = _extract_json_object_candidate(_message_content(last.content).strip())
+
+    if not content.startswith("{"):
+        parsed = _parse_text_tool_call_lenient(content)
+        if parsed:
+            name, args = parsed
+            return _apply_text_tool_call(messages, last, name, args, fallback_owner)
+        return None
+
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError:
+        decoder = json.JSONDecoder()
+        try:
+            payload, _ = decoder.raw_decode(content)
+        except json.JSONDecodeError:
+            parsed = _parse_text_tool_call_lenient(content)
+            if parsed:
+                name, args = parsed
+                return _apply_text_tool_call(messages, last, name, args, fallback_owner)
+            logger.warning("No se pudo parsear tool-call JSON del LLM")
+            return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    name = payload.get("name")
+    args = payload.get("parameters") or payload.get("args")
+    if payload.get("type") == "function" and name:
+        args = args or {}
+    elif isinstance(payload.get("function"), dict):
+        function = payload["function"]
+        name = function.get("name")
+        raw_args = function.get("arguments", {})
+        if isinstance(raw_args, str):
+            try:
+                args = json.loads(raw_args)
+            except json.JSONDecodeError:
+                args = {}
+        else:
+            args = raw_args or {}
+    elif name and args is not None:
+        pass
+    else:
+        return None
+
+    if not name:
+        return None
+
+    return _apply_text_tool_call(messages, last, name, args or {}, fallback_owner)
+
+
 class SingleToolCallMiddleware(AgentMiddleware):
     """Fuerza una sola tool-call por turno (requerido por vLLM/Llama)."""
+
+    def __init__(self, github_owner_fallback: str = ""):
+        self.github_owner_fallback = github_owner_fallback
 
     def _apply_single_tool_call_setting(self, request) -> None:
         if PARALLEL_TOOL_CALLS:
@@ -147,6 +443,24 @@ class SingleToolCallMiddleware(AgentMiddleware):
         last.tool_calls = [last.tool_calls[0]]
         return None
 
+    def _postprocess_model_response(self, state) -> dict | None:
+        messages = state.get("messages", [])
+        coerced_ai = _coerce_text_tool_calls(messages, self.github_owner_fallback)
+
+        if not messages:
+            return {"messages": [coerced_ai]} if coerced_ai is not None else None
+
+        last = messages[-1]
+        if isinstance(last, AIMessage) and last.tool_calls:
+            for tool_call in last.tool_calls:
+                _normalize_github_tool_args(tool_call, self.github_owner_fallback)
+            if len(last.tool_calls) > 1:
+                self._truncate_extra_tool_calls(state)
+
+        if coerced_ai is not None:
+            return {"messages": [coerced_ai]}
+        return None
+
     def wrap_model_call(self, request, handler):
         self._apply_single_tool_call_setting(request)
         return handler(request)
@@ -156,10 +470,10 @@ class SingleToolCallMiddleware(AgentMiddleware):
         return await handler(request)
 
     def after_model(self, state, runtime):
-        return self._truncate_extra_tool_calls(state)
+        return self._postprocess_model_response(state)
 
     async def aafter_model(self, state, runtime):
-        return self._truncate_extra_tool_calls(state)
+        return self._postprocess_model_response(state)
 
 
 def _system_prompt_with_rules(system_prompt: str) -> str:
@@ -175,7 +489,13 @@ model_id = os.getenv("QWEN_MODEL_NAME", "qwen2.5-coder:32b-instruct")
 api_key = os.getenv("QWEN_API_KEY", "")
 temperature = float(os.getenv("TEMPERATURE", "0.1"))
 top_p = float(os.getenv("TOP_P", "0.1"))
-max_completion_tokens = int(os.getenv("MAX_COMPLETION_TOKENS", "4096"))
+_model_max_context = int(os.getenv("MODEL_MAX_CONTEXT_TOKENS", "20000"))
+_input_token_reserve = int(os.getenv("INPUT_TOKEN_RESERVE", "17000"))
+_configured_max_completion = int(os.getenv("MAX_COMPLETION_TOKENS", "4096"))
+max_completion_tokens = min(
+    _configured_max_completion,
+    max(256, _model_max_context - _input_token_reserve),
+)
 embedding_model = os.getenv(
     "EMBEDDINGS_MODEL_NAME",
     "sentence-transformers/ibm-granite/granite-embedding-125m-english",
@@ -243,11 +563,26 @@ Estructura mínima del campo `vulnerabilidades_md`:
 
 ---
 
-(repetir bloque ### por CADA CVE de Trivy)
+(repetir bloque ### por CADA CVE de Trivy dentro del MISMO comentario)
 
-### B) OPENGREP → publicar_comentario_linea_pr (UN comentario POR hallazgo)
+### B) OPENGREP → publicar_comentario_general_pr (UN comentario consolidado)
 
-Estructura mínima del campo `recomendacion` (Markdown):
+Usa la MISMA herramienta `publicar_comentario_general_pr` con el campo `vulnerabilidades_md`.
+NO uses `publicar_comentario_linea_pr` en el flujo de triage.
+
+Estructura mínima del campo `vulnerabilidades_md` (sección SAST):
+
+## Resumen ejecutivo SAST (OpenGrep)
+- Total hallazgos: N
+- Críticos: X | Altos: Y | Medios: Z | Bajos: W
+- Acción prioritaria: (1-2 frases)
+
+## Tabla de hallazgos de código
+| Severidad | Rule ID | CWE | Archivo:Línea | Mensaje |
+|-----------|---------|-----|---------------|---------|
+| ERROR     | rule-id | CWE-78 | src/Foo.java:42 | ... |
+
+## Detalle por hallazgo SAST
 
 ### [SEVERIDAD] rule_id — CWE-XXX
 
@@ -279,6 +614,17 @@ Estructura mínima del campo `recomendacion` (Markdown):
 - [ ] Prueba unitaria o caso negativo añadido si aplica
 - [ ] OpenGrep/SAST sin re-detectar el hallazgo
 
+---
+
+(repetir bloque ### por CADA hallazgo OpenGrep dentro del MISMO comentario)
+
+### Reglas de publicación en GitHub (OBLIGATORIAS)
+- Máximo 2 comentarios por análisis: 1 para TRIVY (si hay hallazgos) y 1 para OPENGREP (si hay hallazgos).
+- PROHIBIDO publicar un comentario GitHub por cada CVE, GHSA o hallazgo individual.
+- PROHIBIDO usar publicar_comentario_linea_pr para CVE/GHSA, dependencias (pom.xml, package.json) o paquetes Maven/npm.
+- PROHIBIDO inventar archivos o líneas de código para hallazgos de dependencias (SCA).
+- Todos los hallazgos de una fuente van consolidados en un único `vulnerabilidades_md`.
+
 ### Reglas de calidad
 - Integra SIEMPRE datos del reporte (CVE, paquete, versión, rule_id, path, line, mensaje).
 - Enriquece con query_company_coding_standards antes de redactar (una consulta por turno).
@@ -299,17 +645,21 @@ triage_system_prompt = os.getenv(
         "Debes analizar SIEMPRE ambas fuentes:\n"
         "1) TRIVY (SCA/dependencias) — sin línea de código.\n"
         "2) OPENGREP (SAST/código) — con archivo y línea.\n\n"
-        "Publicación en GitHub:\n"
-        "- TRIVY → publicar_comentario_general_pr: UN comentario consolidado, "
-        "estructurado con tabla + detalle por CVE (ver GITHUB_REMEDIATION_GUIDE).\n"
-        "- OPENGREP → publicar_comentario_linea_pr: UN comentario POR hallazgo, "
-        "con remediación detallada y código sugerido (ver GITHUB_REMEDIATION_GUIDE).\n\n"
+        "Publicación en GitHub (máximo 2 comentarios por PR):\n"
+        "- TRIVY → publicar_comentario_general_pr: EXACTAMENTE UN comentario con TODOS los CVE "
+        "en vulnerabilidades_md (tabla + detalle por CVE).\n"
+        "- OPENGREP → publicar_comentario_general_pr: EXACTAMENTE UN comentario con TODOS "
+        "los hallazgos SAST en vulnerabilidades_md (tabla + detalle por rule_id).\n"
+        "- NO uses publicar_comentario_linea_pr en este flujo de triage.\n"
+        "- PROHIBIDO: un comentario por CVE/hallazgo; PROHIBIDO: line comments para "
+        "dependencias, pom.xml, CVE o GHSA.\n\n"
         "Calidad de remediación:\n"
         "- Consulta query_company_coding_standards por CVE, CWE o rule_id antes de redactar.\n"
         "- Incluye impacto, pasos concretos, fragmento de código/config y checklist de validación.\n"
-        "- No uses bullets genéricos; cada hallazgo lleva secciones completas.\n"
-        "- NO finalices hasta publicar comentarios para TODOS los ítems del checklist.\n"
-        "- Invoca como máximo UNA herramienta por turno."
+        "- Consolida todos los hallazgos de cada fuente en un solo Markdown antes de publicar.\n"
+        "- NO finalices hasta publicar los comentarios consolidados (SCA y/o SAST) y notificar Slack.\n"
+        "- Invoca como máximo UNA herramienta por turno.\n"
+        "- Usa SIEMPRE tool_calls nativas del API; NO escribas JSON de funciones en el texto."
     ),
 )
 slack_system_prompt = os.getenv(
@@ -333,14 +683,18 @@ triage_user_prompt_template = os.getenv(
         "## Checklist obligatorio\n"
         "{findings_checklist}\n\n"
         "## Flujo (una herramienta por turno)\n"
-        "1. Consulta query_company_coding_standards (CVE, CWE o rule_id) para enriquecer contexto.\n"
-        "2. Redacta comentario SCA estructurado y publícalo con publicar_comentario_general_pr "
-        "(owner={repo_owner}, repo={repo_path}, pr_number={pull_request_number}).\n"
-        "   El campo vulnerabilidades_md DEBE seguir la plantilla TRIVY de GITHUB_REMEDIATION_GUIDE.\n"
-        "3. Por CADA hallazgo OPENGREP: redacta recomendacion con plantilla SAST y publica con "
-        "publicar_comentario_linea_pr (owner={repo_owner}, repo={repo_path}, pr_number={pull_request_number}, commit_id={commit_id}, "
-        "path, line, recomendacion).\n"
-        "4. Notifica fin de análisis en Slack (resumen: total Trivy, total OpenGrep, acciones).\n\n"
+        "1. (Opcional) Consulta query_company_coding_standards para enriquecer contexto.\n"
+        "2. Si hay hallazgos TRIVY (>0 en checklist): redacta UN SOLO comentario SCA consolidado y publícalo "
+        "con publicar_comentario_general_pr (owner={repo_owner}, repo={repo_name}, pr_number={pull_request_number}). "
+        "Incluye TODOS los CVE en vulnerabilidades_md. NO llames esta tool más de una vez para Trivy.\n"
+        "   Si TRIVY=0 hallazgos: NO publiques comentario SCA.\n"
+        "3. Si hay hallazgos OPENGREP (>0 en checklist): redacta UN SOLO comentario SAST consolidado y publícalo "
+        "con publicar_comentario_general_pr (mismos owner/repo/pr). "
+        "Incluye TODOS los hallazgos OpenGrep en vulnerabilidades_md con plantilla SAST. "
+        "NO uses publicar_comentario_linea_pr.\n"
+        "   Si OPENGREP=0 hallazgos: NO publiques comentario SAST.\n"
+        "4. Notifica fin de análisis en Slack (resumen: total Trivy, total OpenGrep, acciones).\n"
+        "Usa SOLO owner y repo cortos (ej. lcoronad, unsecure-quarkus-app); nunca URLs completas.\n\n"
         "## Guía de formato para GitHub\n"
         "{github_remediation_guide}\n\n"
         "## Reportes completos\n"
@@ -358,6 +712,7 @@ slack_user_prompt_template = os.getenv(
 )
 TRIVY_JSON_MAX_CHARS = int(os.getenv("TRIVY_JSON_MAX_CHARS", "15000"))
 OPENGREP_JSON_MAX_CHARS = int(os.getenv("OPENGREP_JSON_MAX_CHARS", "20000"))
+TRIAGE_FINDING_DESC_MAX_CHARS = int(os.getenv("TRIAGE_FINDING_DESC_MAX_CHARS", "180"))
 token = os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN")
 
 llm = ChatOpenAI(
@@ -484,6 +839,7 @@ def publicar_comentario_linea_pr(owner: str, repo: str, pr_number: int, commit_i
     Problema detectado, Riesgo/impacto, Causa raíz, Remediación (pasos),
     Código sugerido (bloque ```), Referencias (CWE/rule_id/normas) y Validación (checklist).
     """
+    owner, repo = _normalize_github_owner_repo(owner, repo)
     url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/comments"
     
     headers = {
@@ -526,13 +882,17 @@ def publicar_comentario_linea_pr(owner: str, repo: str, pr_number: int, commit_i
 @tool
 def publicar_comentario_general_pr(owner: str, repo: str, pr_number: int, vulnerabilidades_md: str) -> str:
     """
-    Publica comentario general SCA (TRIVY) en el PR.
+    Publica comentario consolidado en el PR (SCA y/o SAST).
 
-    El campo `vulnerabilidades_md` debe incluir: resumen ejecutivo, tabla de CVEs,
-    y bloque detallado por CVE (descripción, impacto, remediación, cambio sugerido,
-    referencias y checklist de validación). Ver GITHUB_REMEDIATION_GUIDE.
+    Usa esta herramienta para TODOS los hallazgos de Trivy y OpenGrep.
+    Máximo 1 llamada por fuente (1 para SCA, 1 para SAST).
+
+    El campo `vulnerabilidades_md` debe incluir TODOS los hallazgos de la fuente:
+    resumen ejecutivo, tabla, y bloque detallado por CVE (Trivy) o rule_id (OpenGrep).
+    Ver GITHUB_REMEDIATION_GUIDE. NO publiques un comentario por hallazgo individual.
     """
-    
+    owner, repo = _normalize_github_owner_repo(owner, repo)
+
     # Nota: Para GitHub, los comentarios generales de un PR se hacen en el endpoint de "issues"
     url = f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments"
     
@@ -564,13 +924,13 @@ async def _get_agent_tools():
     return tools
 
 
-async def _build_agent(system_prompt: str):
+async def _build_agent(system_prompt: str, github_owner_fallback: str = ""):
     tools = await _get_agent_tools()
     return create_agent(
         model=llm,
         tools=tools,
         system_prompt=_system_prompt_with_rules(system_prompt),
-        middleware=[SingleToolCallMiddleware()],
+        middleware=[SingleToolCallMiddleware(github_owner_fallback=github_owner_fallback)],
     )
 
 
@@ -598,11 +958,86 @@ def _trim_redis_history(history: RedisChatMessageHistory) -> None:
         history.add_message(message)
 
 
+def _has_unresolved_tool_calls(messages: Sequence[BaseMessage]) -> bool:
+    if not messages:
+        return False
+
+    last = messages[-1]
+    if not isinstance(last, AIMessage) or not last.tool_calls:
+        return False
+
+    pending_ids = [
+        tool_call.get("id")
+        for tool_call in last.tool_calls
+        if tool_call.get("id")
+    ]
+    if not pending_ids:
+        return True
+
+    executed_ids = {
+        message.tool_call_id
+        for message in messages
+        if isinstance(message, ToolMessage) and message.tool_call_id
+    }
+    return any(tool_id not in executed_ids for tool_id in pending_ids)
+
+
 def _final_ai_message(messages: Sequence[BaseMessage]) -> AIMessage | None:
-    for message in reversed(messages):
-        if isinstance(message, AIMessage) and message.content:
-            return message
-    return None
+    last_ai: AIMessage | None = None
+    for message in messages:
+        if isinstance(message, AIMessage):
+            last_ai = message
+    if last_ai is None or last_ai.tool_calls:
+        return None
+    return last_ai if last_ai.content else None
+
+
+async def _execute_tool_call(tool_call: dict[str, Any], tools: list) -> ToolMessage:
+    tool_name = tool_call.get("name", "")
+    tool_args = tool_call.get("args", {}) or {}
+    tool_call_id = tool_call.get("id") or f"call_{uuid.uuid4().hex[:12]}"
+    selected = next((tool for tool in tools if tool.name == tool_name), None)
+    if selected is None:
+        content = f"Error: herramienta no encontrada: {tool_name}"
+    else:
+        try:
+            if hasattr(selected, "ainvoke"):
+                content = await selected.ainvoke(tool_args)
+            else:
+                content = selected.invoke(tool_args)
+            if not isinstance(content, str):
+                content = json.dumps(content, ensure_ascii=False)
+        except Exception as exc:
+            logger.exception("Error ejecutando tool %s manualmente", tool_name)
+            content = f"Error ejecutando {tool_name}: {exc}"
+    return ToolMessage(
+        content=str(content),
+        tool_call_id=tool_call_id,
+        name=tool_name,
+    )
+
+
+async def _manual_run_pending_tools(
+    messages: list[BaseMessage],
+    tools: list,
+    github_owner_fallback: str = "",
+) -> list[BaseMessage] | None:
+    patched = list(messages)
+    coerced_ai = _coerce_text_tool_calls(patched, github_owner_fallback)
+    if coerced_ai is not None:
+        pending = coerced_ai.tool_calls or []
+    else:
+        last = patched[-1] if patched else None
+        if not isinstance(last, AIMessage) or not last.tool_calls:
+            return None
+        pending = last.tool_calls
+
+    if not pending:
+        return None
+
+    for tool_call in pending:
+        patched.append(await _execute_tool_call(tool_call, tools))
+    return patched
 
 
 async def _run_agent(
@@ -611,31 +1046,103 @@ async def _run_agent(
     prior_messages: Sequence[BaseMessage] | None = None,
     *,
     context: str = "agent",
+    github_owner_fallback: str = "",
+    tools: list | None = None,
 ) -> dict:
+    agent_tools = tools or await _get_agent_tools()
     messages = list(prior_messages or []) + [HumanMessage(content=prompt)]
+    agent_config = {"recursion_limit": GRAPH_RECURSION_LIMIT}
     logger.info("[%s] Iniciando ejecución del agente", context)
 
-    result: dict | None = None
-    seen_messages = 0
+    async def _drain_agent(input_messages: list[BaseMessage]) -> dict:
+        result: dict | None = None
+        seen_messages = 0
 
-    async for state in agent.astream(
-        {"messages": messages},
-        config={"recursion_limit": GRAPH_RECURSION_LIMIT},
-        stream_mode="values",
+        try:
+            async for state in agent.astream(
+                {"messages": input_messages},
+                config=agent_config,
+                stream_mode="values",
+            ):
+                current_messages = state.get("messages", [])
+                if _coerce_text_tool_calls(current_messages, github_owner_fallback):
+                    logger.warning(
+                        "[%s] Tool-call en texto reparada durante stream",
+                        context,
+                    )
+                for message in current_messages[seen_messages:]:
+                    _log_message(message, context)
+                seen_messages = len(current_messages)
+                result = state
+        except ValueError as exc:
+            if "No AIMessage found in input" not in str(exc):
+                raise
+            logger.warning(
+                "[%s] ToolNode falló (%s); ejecutando tools manualmente",
+                context,
+                exc,
+            )
+            base_messages = list(result.get("messages", [])) if result else list(input_messages)
+            patched_messages = await _manual_run_pending_tools(
+                base_messages,
+                agent_tools,
+                github_owner_fallback,
+            )
+            if patched_messages is None:
+                raise
+            return {"messages": patched_messages}
+
+        if result is None:
+            try:
+                result = await agent.ainvoke(
+                    {"messages": input_messages},
+                    config=agent_config,
+                )
+            except ValueError as exc:
+                if "No AIMessage found in input" not in str(exc):
+                    raise
+                logger.warning(
+                    "[%s] ToolNode falló en ainvoke; ejecutando tools manualmente",
+                    context,
+                )
+                patched_messages = await _manual_run_pending_tools(
+                    list(input_messages),
+                    agent_tools,
+                    github_owner_fallback,
+                )
+                if patched_messages is None:
+                    raise
+                return {"messages": patched_messages}
+
+            current_messages = result.get("messages", [])
+            if _coerce_text_tool_calls(current_messages, github_owner_fallback):
+                logger.warning("[%s] Tool-call en texto reparada tras ainvoke", context)
+            for message in current_messages[seen_messages:]:
+                _log_message(message, context)
+
+        return result
+
+    result = await _drain_agent(messages)
+    continuation_step = 0
+
+    while (
+        _has_unresolved_tool_calls(result.get("messages", []))
+        and continuation_step < GRAPH_RECURSION_LIMIT
     ):
-        current_messages = state.get("messages", [])
-        for message in current_messages[seen_messages:]:
-            _log_message(message, context)
-        seen_messages = len(current_messages)
-        result = state
-
-    if result is None:
-        result = await agent.ainvoke(
-            {"messages": messages},
-            config={"recursion_limit": GRAPH_RECURSION_LIMIT},
+        continuation_step += 1
+        current_messages = list(result.get("messages", []))
+        if _coerce_text_tool_calls(current_messages, github_owner_fallback):
+            logger.warning(
+                "[%s] Tool-call en texto reparada antes de continuar (paso %s)",
+                context,
+                continuation_step,
+            )
+        logger.warning(
+            "[%s] Hay tool-call pendiente; continuando ejecución del agente (paso %s)",
+            context,
+            continuation_step,
         )
-        for message in result.get("messages", [])[seen_messages:]:
-            _log_message(message, context)
+        result = await _drain_agent(current_messages)
 
     final_ai = _final_ai_message(result.get("messages", []))
     if final_ai is not None:
@@ -673,15 +1180,8 @@ class TriageRequest(BaseModel):
     pull_request_number: str
     repo_owner: str
     commit_id: str
-    trivy_json: dict
-    opengrep_sarif: dict
-
-
-def _split_repo_path(repo_path: str, repo_owner: str) -> tuple[str, str]:
-    if "/" in repo_path:
-        owner, repo = repo_path.split("/", 1)
-        return owner, repo
-    return repo_owner, repo_path
+    trivy_json: list[dict[str, Any]] | dict[str, Any]
+    opengrep_sarif: list[dict[str, Any]] | dict[str, Any]
 
 
 def _normalize_repo_file_path(path: str, repo_name: str) -> str:
@@ -692,8 +1192,22 @@ def _normalize_repo_file_path(path: str, repo_name: str) -> str:
     return normalized
 
 
-def _extract_trivy_findings(trivy_json: dict) -> list[dict[str, Any]]:
+def _extract_trivy_findings(trivy_json: list | dict) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
+    if isinstance(trivy_json, list):
+        for result in trivy_json:
+            findings.append(
+                {
+                    "id": result.get("id", "UNKNOWN"),
+                    "pkg": result.get("pkg", ""),
+                    "severity": result.get("severity", ""),
+                    "target": result.get("target", ""),
+                    "fixed_version": result.get("fixed_version", ""),
+                    "description": result.get("description", ""),
+                }
+            )
+        return findings
+
     for result in trivy_json.get("Results", []):
         target = result.get("Target", "")
         for vuln in result.get("Vulnerabilities", []) or []:
@@ -708,6 +1222,53 @@ def _extract_trivy_findings(trivy_json: dict) -> list[dict[str, Any]]:
                 }
             )
     return findings
+
+
+def _truncate_field(text: str, max_len: int) -> str:
+    text = str(text or "").strip()
+    if len(text) <= max_len:
+        return text
+    return f"{text[:max_len].rstrip()}..."
+
+
+def _compact_trivy_for_prompt(trivy_json: list | dict) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": finding["id"],
+            "pkg": finding["pkg"],
+            "severity": finding["severity"],
+            "target": finding["target"],
+            "fixed_version": finding["fixed_version"],
+            "description": _truncate_field(
+                finding.get("description", ""), TRIAGE_FINDING_DESC_MAX_CHARS
+            ),
+        }
+        for finding in _extract_trivy_findings(trivy_json)
+    ]
+
+
+def _compact_opengrep_for_prompt(opengrep_sarif: list | dict) -> list[dict[str, Any]]:
+    return [
+        {
+            "rule_id": finding["rule_id"],
+            "path": finding["path"],
+            "line": finding["line"],
+            "severity": finding["severity"],
+            "cwe": finding["cwe"],
+            "message": _truncate_field(finding.get("message", ""), TRIAGE_FINDING_DESC_MAX_CHARS),
+        }
+        for finding in _extract_opengrep_findings(opengrep_sarif)
+    ]
+
+
+def _severity_summary(findings: list[dict[str, Any]]) -> str:
+    counts: dict[str, int] = {}
+    for finding in findings:
+        severity = str(finding.get("severity") or "UNKNOWN").upper()
+        counts[severity] = counts.get(severity, 0) + 1
+    if not counts:
+        return "sin hallazgos"
+    return ", ".join(f"{severity}={count}" for severity, count in sorted(counts.items()))
 
 
 def _opengrep_result_line(result: dict[str, Any]) -> int | None:
@@ -745,8 +1306,22 @@ def _opengrep_result_message(result: dict[str, Any]) -> str:
     return str(message or "")
 
 
-def _extract_opengrep_findings(opengrep_sarif: dict) -> list[dict[str, Any]]:
+def _extract_opengrep_findings(opengrep_sarif: list | dict) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
+    if isinstance(opengrep_sarif, list):
+        for result in opengrep_sarif:
+            findings.append(
+                {
+                    "rule_id": result.get("rule_id", "UNKNOWN"),
+                    "path": result.get("path", ""),
+                    "line": result.get("line", 0),
+                    "severity": result.get("severity", ""),
+                    "message": result.get("message", ""),
+                    "cwe": result.get("cwe", ""),
+                }
+            )
+        return findings
+
     for run in opengrep_sarif.get("runs", []):
         for result in run.get("results", []) or []:
             rule_id = result.get("check_id") or result.get("ruleId") or "UNKNOWN"
@@ -774,24 +1349,29 @@ def _build_findings_checklist(data: TriageRequest) -> str:
     lines = [
         f"Owner={owner}, Repo={repo_name}, PR={data.pull_request_number}, Commit={data.commit_id}",
         "",
-        f"### TRIVY ({len(trivy_findings)} hallazgos) → publicar_comentario_general_pr",
+        f"### TRIVY ({len(trivy_findings)} hallazgos) → UN SOLO publicar_comentario_general_pr",
     ]
 
     if trivy_findings:
-        for idx, finding in enumerate(trivy_findings, start=1):
-            lines.append(
-                f"{idx}. [{finding['severity']}] {finding['id']} en {finding['pkg']} "
-                f"(target: {finding['target']}) → remediar a {finding['fixed_version'] or 'ver advisory'}"
-            )
+        lines.append(
+            f"   Resumen severidad: {_severity_summary(trivy_findings)}. "
+            f"Incluir los {len(trivy_findings)} CVE/GHSA en un único vulnerabilidades_md."
+        )
+        trivy_ids = ", ".join(finding["id"] for finding in trivy_findings)
+        lines.append(f"   IDs: {trivy_ids}")
     else:
-        lines.append("- Sin hallazgos Trivy.")
+        lines.append("- Sin hallazgos Trivy. Omitir comentario SCA.")
 
     lines.append("")
     lines.append(
-        f"### OPENGREP ({len(opengrep_findings)} hallazgos) → publicar_comentario_linea_pr (uno por hallazgo)"
+        f"### OPENGREP ({len(opengrep_findings)} hallazgos) → UN SOLO publicar_comentario_general_pr"
     )
 
     if opengrep_findings:
+        lines.append(
+            f"   Incluir los {len(opengrep_findings)} hallazgos SAST en un único vulnerabilidades_md "
+            f"(tabla + detalle). NO usar publicar_comentario_linea_pr."
+        )
         for idx, finding in enumerate(opengrep_findings, start=1):
             path = _normalize_repo_file_path(finding["path"], repo_name)
             line = finding["line"] if finding["line"] is not None else "?"
@@ -799,23 +1379,17 @@ def _build_findings_checklist(data: TriageRequest) -> str:
                 f"{idx}. [{finding['severity']}] {finding['rule_id']} "
                 f"en {path}:{line} — {finding['message']}"
             )
-            lines.append(
-                f"   → publicar_comentario_linea_pr(owner={owner}, repo={repo_name}, "
-                f"pr_number={data.pull_request_number}, commit_id={data.commit_id}, "
-                f"path={path}, line={line}, recomendacion=...)"
-            )
     else:
-        lines.append("- Sin hallazgos OpenGrep.")
+        lines.append("- Sin hallazgos OpenGrep. Omitir comentario SAST.")
 
     lines.append("")
     lines.append("### Formato esperado en GitHub")
-    lines.append("- TRIVY: resumen + tabla + detalle por CVE con remediación y validación.")
-    lines.append(
-        "- OPENGREP: un comentario por hallazgo con impacto, causa, fix, código sugerido y validación."
-    )
+    lines.append("- Máximo 2 comentarios: 1 consolidado SCA (Trivy) + 1 consolidado SAST (OpenGrep).")
+    lines.append("- Cada comentario incluye resumen, tabla y detalle de TODOS sus hallazgos.")
     lines.append("")
     lines.append(
-        "IMPORTANTE: Debes publicar comentarios para TODOS los hallazgos anteriores antes de Slack."
+        "IMPORTANTE: Consolida todos los hallazgos antes de publicar. "
+        "NO publiques un comentario GitHub por cada CVE o rule_id."
     )
     return "\n".join(lines)
 
@@ -827,10 +1401,12 @@ def _build_triage_prompt(data: TriageRequest) -> str:
         guide = ""
 
     return triage_user_prompt_template.format(
-        trivy_json=json.dumps(data.trivy_json, ensure_ascii=False)[:TRIVY_JSON_MAX_CHARS],
-        opengrep_sarif=json.dumps(data.opengrep_sarif, ensure_ascii=False)[
-            :OPENGREP_JSON_MAX_CHARS
-        ],
+        trivy_json=json.dumps(
+            _compact_trivy_for_prompt(data.trivy_json), ensure_ascii=False
+        )[:TRIVY_JSON_MAX_CHARS],
+        opengrep_sarif=json.dumps(
+            _compact_opengrep_for_prompt(data.opengrep_sarif), ensure_ascii=False
+        )[:OPENGREP_JSON_MAX_CHARS],
         repo_path=data.repo_path,
         pull_request_number=data.pull_request_number,
         repo_owner=owner,
@@ -860,12 +1436,16 @@ async def process_async_triage(data: TriageRequest):
             trivy_count,
             opengrep_count,
         )
-        agent = await _build_agent(triage_system_prompt)
+        owner, _ = _split_repo_path(data.repo_path, data.repo_owner)
+        tools = await _get_agent_tools()
+        agent = await _build_agent(triage_system_prompt, github_owner_fallback=owner)
         prompt = _build_triage_prompt(data)
         await _run_agent(
             agent,
             prompt,
             context=f"triage:{data.repo_path}#PR{data.pull_request_number}",
+            github_owner_fallback=owner,
+            tools=tools,
         )
     except Exception:
         logger.exception(
